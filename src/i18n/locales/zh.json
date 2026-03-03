@@ -139,7 +139,10 @@
     "secret": {
       "fido2UnsupportedPlatform": "当前平台暂不支持原生 FIDO2，请改用系统钥匙串或明文兼容模式",
       "fido2NativeNotEnabled": "原生 FIDO2 尚未启用，请暂时使用 emulated 后端或其他策略",
-      "fido2RefreshProbe": "刷新 FIDO2 探测"
+      "fido2RefreshProbe": "刷新 FIDO2 探测",
+      "fido2CopyProbeSummary": "复制调试摘要",
+      "fido2ProbeSummaryCopied": "FIDO2 调试摘要已复制",
+      "fido2ProbeSummaryCopyFailed": "复制 FIDO2 调试摘要失败"
     },
     "form": {
       "gemini": {

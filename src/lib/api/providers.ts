@@ -224,8 +224,10 @@ export const providersApi = {
     });
   },
 
-  async getNativeFido2Capability(): Promise<NativeFido2Capability> {
-    return await invoke("get_native_fido2_capability");
+  async getNativeFido2Capability(
+    traceId?: string,
+  ): Promise<NativeFido2Capability> {
+    return await invoke("get_native_fido2_capability", { traceId });
   },
 
   async rotateSecret(

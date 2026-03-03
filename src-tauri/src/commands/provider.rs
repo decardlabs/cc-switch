@@ -517,10 +517,12 @@ pub fn verify_provider_secret_fido2_assertion(
 
 #[tauri::command]
 pub fn get_native_fido2_capability(
+    #[allow(non_snake_case)] traceId: Option<String>,
 ) -> Result<crate::services::secret_store::fido2::NativeFido2Capability, String> {
     let capability = fido2::probe_native_capability();
     log::debug!(
-        "[FIDO2] native probe capability backend={} platform={} available={} code={}",
+        "[FIDO2] native probe capability traceId={} backend={} platform={} available={} code={}",
+        traceId.as_deref().unwrap_or("none"),
         capability.backend,
         capability.platform,
         capability.available,

@@ -194,6 +194,34 @@ fn resolve_provider_secret(state: &AppState, app: AppType, provider: &Provider, 
 
 > 进展备注（Phase 3-16）：`ProviderSecretPanel` 已增加仅开发环境可见的前端观测日志，联合记录 `policy` 与 native probe 结果（`backend/platform/available/code`），用于定位“策略与平台能力不匹配”的触发路径。
 
+> 进展备注（Phase 3-17）：前端观测日志已加入轻量去重：同一 `app/provider/policy/backend/platform/available/code` 组合仅输出一次，减少开发态重复刷屏并保留关键路径可见性。
+
+> 进展备注（Phase 3-18）：开发环境下新增“复制调试摘要”能力：`ProviderSecretPanel` 可一键复制 native probe 摘要（`app/provider/policy/backend/platform/available/code/reason`），便于快速回传联调信息且不涉及密钥数据。
+
+> 进展备注（Phase 3-19）：复制的调试摘要已升级为标准 JSON（pretty print），新增 `schemaVersion`、`appVersion` 与 `generatedAt` 字段，便于直接粘贴到 issue/日志系统进行结构化分析。
+
+> 进展备注（Phase 3-20）：调试摘要 JSON 已新增 `traceId` 字段（优先使用 `crypto.randomUUID()`），用于串联同一次前后端联调日志，提升问题定位效率。
+
+> 进展备注（Phase 3-21）：`get_native_fido2_capability` 已支持接收可选 `traceId` 并写入后端诊断日志；前端 probe 调用同步透传同一 `traceId`，复制的调试摘要优先复用该值，实现前后端日志一键对齐。
+
+> 进展备注（Phase 3-22）：复制的调试摘要 JSON 已补充 probe 时序字段（`probeRequestedAt` / `probeCompletedAt`），结合 `traceId` 可更直观地还原单次联调请求的时间线。
+
+> 进展备注（Phase 3-23）：调试摘要 JSON 已新增 `probeDurationMs`（由 probe 请求/完成时间自动计算），用于快速横向比较不同平台或不同实现阶段的探测耗时。
+
+> 进展备注（Phase 3-24）：probe 失败路径已纳入调试摘要：即使 native probe 调用报错，也可复制结构化 JSON（新增 `probeOutcome` / `probeError`），确保失败现场可直接回传并用于排障。
+
+> 进展备注（Phase 3-25）：已修正 probe 失败后的状态一致性：失败时会清理旧的 native capability 快照，避免沿用过期成功结果；同时失败日志附带 `traceId`，便于与摘要 JSON 精确对齐。
+
+> 进展备注（Phase 3-26）：调试摘要 JSON 已补充 `probeAttempt` 与 `probeErrorCode`（从错误信息中提取如 `FIDO2_*` 码），用于多次重试场景下按“尝试序号 + 错误码”进行快速聚合分析。
+
+> 进展备注（Phase 3-27）：调试摘要 JSON 已新增 `probeSessionId`（面板打开期间固定、关闭后重置），用于将同一面板会话中的多次 probe 尝试聚合分析。
+
+> 进展备注（Phase 3-28）：面板关闭时已重置 probe 调试状态（`probeSessionId/traceId/attempt/timeline/error/capability`），确保下次打开后的调试摘要不会混入上一会话残留数据。
+
+> 进展备注（Phase 3-29）：调试摘要 JSON 已新增 `probeTrigger`（`auto` / `manual`），用于区分“自动首探测”与“手动刷新”来源，便于定位触发上下文。
+
+> 进展备注（Phase 3-30）：调试摘要 JSON 已新增 `probeContext`（策略与挑战上下文），包含 `policy/isFido2Required/hasChallenge/challengeId/challengeExpired`，便于结合 `probeTrigger` 还原触发时的前端状态。
+
 
 ## Phase 2（切换读路径）
 

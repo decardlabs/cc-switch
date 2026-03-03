@@ -139,7 +139,10 @@
     "secret": {
       "fido2UnsupportedPlatform": "このプラットフォームではネイティブ FIDO2 がまだサポートされていません。システムキーチェーンまたは互換モードを利用してください。",
       "fido2NativeNotEnabled": "ネイティブ FIDO2 はまだ有効化されていません。しばらくは emulated バックエンドまたは他のポリシーを利用してください。",
-      "fido2RefreshProbe": "FIDO2 プローブを再取得"
+      "fido2RefreshProbe": "FIDO2 プローブを再取得",
+      "fido2CopyProbeSummary": "デバッグ要約をコピー",
+      "fido2ProbeSummaryCopied": "FIDO2 デバッグ要約をコピーしました",
+      "fido2ProbeSummaryCopyFailed": "FIDO2 デバッグ要約のコピーに失敗しました"
     },
     "form": {
       "gemini": {

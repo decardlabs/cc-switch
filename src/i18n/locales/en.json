@@ -139,7 +139,10 @@
     "secret": {
       "fido2UnsupportedPlatform": "Native FIDO2 is not supported on this platform yet. Please use OS keychain or plain compatibility mode.",
       "fido2NativeNotEnabled": "Native FIDO2 is not enabled yet. Please use the emulated backend or another policy for now.",
-      "fido2RefreshProbe": "Refresh FIDO2 probe"
+      "fido2RefreshProbe": "Refresh FIDO2 probe",
+      "fido2CopyProbeSummary": "Copy debug summary",
+      "fido2ProbeSummaryCopied": "FIDO2 debug summary copied",
+      "fido2ProbeSummaryCopyFailed": "Failed to copy FIDO2 debug summary"
     },
     "form": {
       "gemini": {

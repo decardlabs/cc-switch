@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
+import { getVersion } from "@tauri-apps/api/app";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -35,6 +36,13 @@ const POLICY_OPTIONS: SecretPolicy[] = [
 
 const IS_DEV = import.meta.env.DEV;
 
+function createTraceId(): string {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return `trace-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 export function ProviderSecretPanel({
   appId,
   providerId,
@@ -52,24 +60,64 @@ export function ProviderSecretPanel({
   const [nativeFido2Capability, setNativeFido2Capability] =
     useState<NativeFido2Capability | null>(null);
   const [nativeProbeLoading, setNativeProbeLoading] = useState(false);
+  const [nativeProbeSessionId, setNativeProbeSessionId] = useState<
+    string | null
+  >(null);
+  const [nativeProbeTraceId, setNativeProbeTraceId] = useState<string | null>(
+    null,
+  );
+  const [nativeProbeRequestedAt, setNativeProbeRequestedAt] = useState<
+    string | null
+  >(null);
+  const [nativeProbeCompletedAt, setNativeProbeCompletedAt] = useState<
+    string | null
+  >(null);
+  const [nativeProbeTrigger, setNativeProbeTrigger] = useState<
+    "auto" | "manual" | null
+  >(null);
+  const [nativeProbeAttempt, setNativeProbeAttempt] = useState(0);
+  const [nativeProbeError, setNativeProbeError] = useState<string | null>(
+    null,
+  );
+  const [appVersion, setAppVersion] = useState("unknown");
+  const seenNativeCapabilityLogsRef = useRef<Set<string>>(new Set());
   const [nowSeconds, setNowSeconds] = useState(() =>
     Math.floor(Date.now() / 1000),
   );
 
-  const loadNativeFido2Capability = useCallback(async () => {
+  const loadNativeFido2Capability = useCallback(
+    async (trigger: "auto" | "manual") => {
+    const traceId = createTraceId();
+    setNativeProbeTrigger(trigger);
+    setNativeProbeTraceId(traceId);
+    setNativeProbeAttempt((value: number) => value + 1);
+    setNativeProbeRequestedAt(new Date().toISOString());
+    setNativeProbeCompletedAt(null);
+    setNativeProbeError(null);
     setNativeProbeLoading(true);
     try {
-      const capability = await providersApi.getNativeFido2Capability();
+      const capability = await providersApi.getNativeFido2Capability(traceId);
       setNativeFido2Capability(capability);
+      setNativeProbeError(null);
     } catch (error) {
+      const message =
+        error instanceof Error ? error.message : String(error ?? "unknown");
+      setNativeProbeError(message);
+      setNativeFido2Capability(null);
       console.warn(
         "[ProviderSecretPanel] failed to probe native fido2 capability",
-        error,
+        {
+          traceId,
+          error,
+        },
       );
     } finally {
+      setNativeProbeCompletedAt(new Date().toISOString());
       setNativeProbeLoading(false);
     }
-  }, []);
+    },
+    [],
+  );
 
   const loadStatus = useCallback(async () => {
     if (!open || !providerId) return;
@@ -111,8 +159,49 @@ export function ProviderSecretPanel({
       return;
     }
 
-    void loadNativeFido2Capability();
+    void loadNativeFido2Capability("auto");
   }, [open, nativeFido2Capability, loadNativeFido2Capability]);
+
+  useEffect(() => {
+    if (!open) {
+      setNativeProbeSessionId(null);
+      setNativeProbeTraceId(null);
+      setNativeProbeRequestedAt(null);
+      setNativeProbeCompletedAt(null);
+      setNativeProbeAttempt(0);
+      setNativeProbeTrigger(null);
+      setNativeProbeError(null);
+      setNativeFido2Capability(null);
+      return;
+    }
+
+    setNativeProbeSessionId(
+      (value: string | null) => value ?? createTraceId(),
+    );
+  }, [open]);
+
+  useEffect(() => {
+    if (!IS_DEV || !open) {
+      return;
+    }
+
+    let active = true;
+    void getVersion()
+      .then((version: string) => {
+        if (active) {
+          setAppVersion(version || "unknown");
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setAppVersion("unknown");
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [open]);
 
   const getFido2UnavailableMessage = useCallback(
     (message?: string) => {
@@ -155,6 +244,80 @@ export function ProviderSecretPanel({
   const fido2ChallengeExpired =
     fido2RemainingSeconds !== null && fido2RemainingSeconds <= 0;
 
+  const nativeProbeDebugPayload = useMemo(() => {
+    if (
+      !nativeFido2Capability &&
+      !nativeProbeRequestedAt &&
+      !nativeProbeCompletedAt &&
+      !nativeProbeError
+    ) {
+      return null;
+    }
+
+    const activePolicy = status?.policy ?? policy;
+    const isFido2Required = activePolicy === "fido2_required";
+    const requestedAtMs = nativeProbeRequestedAt
+      ? Date.parse(nativeProbeRequestedAt)
+      : Number.NaN;
+    const completedAtMs = nativeProbeCompletedAt
+      ? Date.parse(nativeProbeCompletedAt)
+      : Number.NaN;
+    const hasDuration =
+      Number.isFinite(requestedAtMs) &&
+      Number.isFinite(completedAtMs) &&
+      completedAtMs >= requestedAtMs;
+    const probeErrorCode = nativeProbeError?.match(/FIDO2_[A-Z0-9_]+/)?.[0] ?? null;
+    const probeOutcome = nativeProbeError
+      ? "error"
+      : nativeFido2Capability
+        ? "success"
+        : "pending";
+
+    return {
+      schemaVersion: "1.0",
+      appVersion,
+      appId,
+      providerId,
+      probeSessionId: nativeProbeSessionId ?? "none",
+      probeTrigger: nativeProbeTrigger ?? "none",
+      probeAttempt: nativeProbeAttempt,
+      probeRequestedAt: nativeProbeRequestedAt ?? "none",
+      probeCompletedAt: nativeProbeCompletedAt ?? "none",
+      probeDurationMs: hasDuration ? completedAtMs - requestedAtMs : null,
+      probeOutcome,
+      probeErrorCode: probeErrorCode ?? "none",
+      probeError: nativeProbeError ?? "none",
+      probeContext: {
+        policy: activePolicy,
+        isFido2Required,
+        hasChallenge: Boolean(fido2Challenge),
+        challengeId: fido2Challenge?.challengeId ?? "none",
+        challengeExpired: Boolean(fido2ChallengeExpired),
+      },
+      policy: activePolicy,
+      backend: nativeFido2Capability?.backend ?? "none",
+      platform: nativeFido2Capability?.platform ?? "none",
+      available: nativeFido2Capability?.available ?? false,
+      code: nativeFido2Capability?.code ?? "none",
+      reason: nativeFido2Capability?.reason ?? "none",
+    };
+  }, [
+    appVersion,
+    appId,
+    providerId,
+    nativeProbeSessionId,
+    nativeProbeTrigger,
+    nativeProbeAttempt,
+    nativeProbeRequestedAt,
+    nativeProbeCompletedAt,
+    nativeProbeError,
+    policy,
+    status?.policy,
+    fido2Challenge,
+    fido2ChallengeExpired,
+    nativeFido2Capability,
+  ]);
+
   const policyLabel = useMemo(() => {
     const current = status?.policy ?? policy;
     if (current === "fido2_required") {
@@ -174,6 +337,21 @@ export function ProviderSecretPanel({
     }
 
     const activePolicy = status?.policy ?? policy;
+    const dedupeKey = [
+      appId,
+      providerId,
+      activePolicy,
+      nativeFido2Capability.backend,
+      nativeFido2Capability.platform,
+      nativeFido2Capability.available ? "1" : "0",
+      nativeFido2Capability.code ?? "none",
+    ].join("|");
+
+    if (seenNativeCapabilityLogsRef.current.has(dedupeKey)) {
+      return;
+    }
+    seenNativeCapabilityLogsRef.current.add(dedupeKey);
+
     console.debug("[ProviderSecretPanel] native capability observed", {
       appId,
       providerId,
@@ -190,6 +368,31 @@ export function ProviderSecretPanel({
     status?.policy,
     nativeFido2Capability,
   ]);
+
+  const handleCopyNativeProbeSummary = useCallback(async () => {
+    if (!nativeProbeDebugPayload) {
+      return;
+    }
+
+    try {
+      const traceId = nativeProbeTraceId ?? createTraceId();
+
+      const summary = {
+        ...nativeProbeDebugPayload,
+        traceId,
+        generatedAt: new Date().toISOString(),
+      };
+      await navigator.clipboard.writeText(JSON.stringify(summary, null, 2));
+      toast.success(t("provider.secret.fido2ProbeSummaryCopied", {
+        defaultValue: "FIDO2 调试摘要已复制",
+      }));
+    } catch (error) {
+      console.warn("[ProviderSecretPanel] failed to copy native probe summary", error);
+      toast.error(t("provider.secret.fido2ProbeSummaryCopyFailed", {
+        defaultValue: "复制 FIDO2 调试摘要失败",
+      }));
+    }
+  }, [nativeProbeDebugPayload, nativeProbeTraceId, t]);
 
   const handleEnroll = useCallback(async () => {
     setLoading(true);
@@ -543,15 +746,24 @@ export function ProviderSecretPanel({
             ) : null}
 
             {IS_DEV ? (
-              <Button
-                variant="outline"
-                onClick={loadNativeFido2Capability}
-                disabled={loading || nativeProbeLoading}
-              >
-                {t("provider.secret.fido2RefreshProbe", {
-                  defaultValue: "刷新 FIDO2 探测",
-                })}
-              </Button>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <Button
+                  variant="outline"
+                  onClick={() => void loadNativeFido2Capability("manual")}
+                  disabled={loading || nativeProbeLoading}
+                >
+                  {t("provider.secret.fido2RefreshProbe")}
+                </Button>
+                <Button
+                  variant="outline"
+                  onClick={handleCopyNativeProbeSummary}
+                  disabled={!nativeProbeDebugPayload || loading || nativeProbeLoading}
+                >
+                  {t("provider.secret.fido2CopyProbeSummary", {
+                    defaultValue: "复制调试摘要",
+                  })}
+                </Button>
+              </div>
             ) : null}
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
