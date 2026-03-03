@@ -6,7 +6,8 @@
 //! - **Gemini**: API Key 认证 (x-goog-api-key)
 //! - **GeminiCli**: OAuth Bearer 认证 (用于 Gemini CLI)
 
-use super::{AuthInfo, AuthStrategy, ProviderAdapter, ProviderType};
+use super::{resolve_secret_for_proxy, AuthInfo, AuthStrategy, ProviderAdapter, ProviderType};
+use crate::app_config::AppType;
 use crate::provider::Provider;
 use crate::proxy::error::ProxyError;
 use reqwest::RequestBuilder;
@@ -134,6 +135,10 @@ impl GeminiAdapter {
             .and_then(|v| v.as_str())
         {
             return Some(key.to_string());
+        }
+
+        if let Some(secret) = resolve_secret_for_proxy(provider, AppType::Gemini) {
+            return Some(secret);
         }
 
         None

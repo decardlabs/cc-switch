@@ -11,7 +11,8 @@
 //! - **ClaudeAuth**: 中转服务 (仅 Bearer 认证，无 x-api-key)
 //! - **OpenRouter**: 已支持 Claude Code 兼容接口，默认透传
 
-use super::{AuthInfo, AuthStrategy, ProviderAdapter, ProviderType};
+use super::{resolve_secret_for_proxy, AuthInfo, AuthStrategy, ProviderAdapter, ProviderType};
+use crate::app_config::AppType;
 use crate::provider::Provider;
 use crate::proxy::error::ProxyError;
 use reqwest::RequestBuilder;
@@ -176,6 +177,11 @@ impl ClaudeAdapter {
         {
             log::debug!("[Claude] 使用 apiKey/api_key");
             return Some(key.to_string());
+        }
+
+        if let Some(secret) = resolve_secret_for_proxy(provider, AppType::Claude) {
+            log::debug!("[Claude] 使用 SecretStore 回退密钥");
+            return Some(secret);
         }
 
         log::warn!("[Claude] 未找到有效的 API Key");

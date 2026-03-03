@@ -146,6 +146,16 @@ export interface ProviderMeta {
   // - "anthropic": 原生 Anthropic Messages API 格式，直接透传
   // - "openai_chat": OpenAI Chat Completions 格式，需要格式转换
   apiFormat?: "anthropic" | "openai_chat";
+  // SecretStore 中的密钥引用 ID
+  secretRef?: string;
+  // 密钥保护策略
+  secretPolicy?: "plain" | "os_keychain" | "fido2_required";
+  // 最近一次解锁时间（unix 秒）
+  secretLastUnlockedAt?: number;
+  // 用量查询专用密钥引用 ID（usageApiKey 与主 API key 不同时使用）
+  usageSecretRef?: string;
+  // 用量查询专用密钥保护策略
+  usageSecretPolicy?: "plain" | "os_keychain" | "fido2_required";
 }
 
 // Skill 同步方式

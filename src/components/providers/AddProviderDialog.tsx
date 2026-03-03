@@ -19,6 +19,7 @@ import { codexProviderPresets } from "@/config/codexProviderPresets";
 import { geminiProviderPresets } from "@/config/geminiProviderPresets";
 import type { OpenClawSuggestedDefaults } from "@/config/openclawProviderPresets";
 import type { UniversalProviderPreset } from "@/config/universalProviderPresets";
+import { mergeProviderMetaPreserveSecrets } from "@/utils/providerMetaUtils";
 
 interface AddProviderDialogProps {
   open: boolean;
@@ -99,7 +100,7 @@ export function AddProviderDialog({
         icon: values.icon?.trim() || undefined,
         iconColor: values.iconColor?.trim() || undefined,
         ...(values.presetCategory ? { category: values.presetCategory } : {}),
-        ...(values.meta ? { meta: values.meta } : {}),
+        meta: mergeProviderMetaPreserveSecrets(undefined, values.meta),
       };
 
       // OpenCode/OpenClaw: pass providerKey for ID generation

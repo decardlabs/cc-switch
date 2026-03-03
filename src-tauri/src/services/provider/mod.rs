@@ -7,6 +7,7 @@ mod gemini_auth;
 mod live;
 mod usage;
 
+
 use indexmap::IndexMap;
 use regex::Regex;
 use serde::Deserialize;
@@ -16,6 +17,7 @@ use crate::app_config::AppType;
 use crate::error::AppError;
 use crate::provider::{Provider, UsageResult};
 use crate::services::mcp::McpService;
+use crate::services::secret_store::{SecretPolicy, SecretStoreService};
 use crate::settings::CustomEndpoint;
 use crate::store::AppState;
 
@@ -48,13 +50,18 @@ pub struct SwitchResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::Database;
+    use crate::provider::{ProviderMeta, UsageScript};
+    use crate::store::AppState;
     use serde_json::json;
+    use std::sync::Arc;
 
     #[test]
     fn validate_provider_settings_rejects_missing_auth() {
         let provider = Provider::with_id(
             "codex".into(),
             "Codex".into(),
+
             json!({ "config": "base_url = \"https://example.com\"" }),
             None,
         );
@@ -107,10 +114,12 @@ base_url = "http://localhost:8080"
         assert!(
             !extracted
                 .lines()
+
                 .any(|line| line.trim_start().starts_with("model_provider")),
             "should remove top-level model_provider"
         );
         assert!(
+
             !extracted
                 .lines()
                 .any(|line| line.trim_start().starts_with("model =")),
@@ -125,9 +134,256 @@ base_url = "http://localhost:8080"
             "should keep mcp_servers.* base_url"
         );
     }
+
+    #[test]
+    fn migrate_usage_script_secret_moves_plaintext_to_secret_store() {
+        let mut provider = Provider::with_id(
+            "p-usage".into(),
+            "Usage Provider".into(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.anthropic.com"
+                }
+            }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            usage_script: Some(UsageScript {
+                enabled: true,
+                language: "javascript".to_string(),
+                code: "return { success: true, data: [] };".to_string(),
+                timeout: Some(10),
+                api_key: Some("usage-inline-secret".to_string()),
+                base_url: None,
+                access_token: None,
+                user_id: None,
+                template_type: None,
+                auto_query_interval: None,
+            }),
+            ..Default::default()
+        });
+
+        ProviderService::migrate_usage_script_secret_if_needed(&AppType::Claude, &mut provider)
+            .expect("migrate usage secret");
+
+        let meta = provider.meta.expect("meta exists");
+        let usage_ref = meta.usage_secret_ref.expect("usage secret ref exists");
+        assert_eq!(meta.usage_secret_policy.as_deref(), Some("plain"));
+        assert!(
+            meta.usage_script
+                .and_then(|script| script.api_key)
+                .is_none(),
+            "usage script plaintext key should be cleared"
+        );
+
+        let usage_secret =
+            SecretStoreService::read_secret(AppType::Claude, &usage_ref, None)
+                .expect("read usage secret")
+                .expect("usage secret exists");
+        assert_eq!(usage_secret, "usage-inline-secret");
+    }
+
+    #[test]
+    fn delete_provider_cleans_primary_and_usage_secrets() {
+        let db = Arc::new(Database::memory().expect("init db"));
+        let state = AppState::new(db.clone());
+
+        let current = Provider::with_id(
+            "current-provider".into(),
+            "Current Provider".into(),
+            json!({
+                "env": {
+                    "ANTHROPIC_AUTH_TOKEN": "current-token",
+                    "ANTHROPIC_BASE_URL": "https://api.anthropic.com"
+                }
+            }),
+            None,
+        );
+        ProviderService::add(&state, AppType::Claude, current).expect("add current provider");
+
+        let mut target = Provider::with_id(
+            "delete-provider".into(),
+            "Delete Provider".into(),
+            json!({
+                "env": {
+                    "ANTHROPIC_AUTH_TOKEN": "target-token",
+                    "ANTHROPIC_BASE_URL": "https://api.anthropic.com"
+                }
+            }),
+            None,
+        );
+        target.meta = Some(ProviderMeta {
+            usage_script: Some(UsageScript {
+                enabled: true,
+                language: "javascript".to_string(),
+                code: "return { success: true, data: [] };".to_string(),
+                timeout: Some(10),
+                api_key: Some("target-usage-token".to_string()),
+                base_url: None,
+                access_token: None,
+                user_id: None,
+                template_type: None,
+                auto_query_interval: None,
+            }),
+            ..Default::default()
+        });
+        ProviderService::add(&state, AppType::Claude, target).expect("add target provider");
+
+        SecretStoreService::bind_secret(
+            AppType::Claude,
+            "delete-provider",
+            "target-token",
+            SecretPolicy::Plain,
+        )
+        .expect("bind primary secret");
+
+        assert!(
+            SecretStoreService::read_secret(AppType::Claude, "delete-provider", None)
+                .expect("read primary before delete")
+                .is_some()
+        );
+        assert!(
+            SecretStoreService::read_secret(AppType::Claude, "delete-provider::usage", None)
+                .expect("read usage before delete")
+                .is_some()
+        );
+
+        ProviderService::delete(&state, AppType::Claude, "delete-provider")
+            .expect("delete provider");
+
+        assert!(
+            SecretStoreService::read_secret(AppType::Claude, "delete-provider", None)
+                .expect("read primary after delete")
+                .is_none()
+        );
+        assert!(
+            SecretStoreService::read_secret(AppType::Claude, "delete-provider::usage", None)
+                .expect("read usage after delete")
+                .is_none()
+        );
+    }
 }
 
 impl ProviderService {
+    fn secret_policy_to_meta_value(policy: &SecretPolicy) -> String {
+        match policy {
+            SecretPolicy::Plain => "plain".to_string(),
+            SecretPolicy::OsKeychain => "os_keychain".to_string(),
+            SecretPolicy::Fido2Required => "fido2_required".to_string(),
+        }
+    }
+
+    fn migrate_usage_script_secret_if_needed(
+        app_type: &AppType,
+        provider: &mut Provider,
+    ) -> Result<(), AppError> {
+        let usage_api_key = provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.usage_script.as_ref())
+            .and_then(|script| script.api_key.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+
+        let Some(usage_api_key) = usage_api_key else {
+            return Ok(());
+        };
+
+        let policy = provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.secret_policy.as_deref())
+            .map(|value| SecretPolicy::parse(Some(value)))
+            .unwrap_or(SecretPolicy::Plain);
+
+        let usage_secret_ref = provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.usage_secret_ref.clone())
+            .unwrap_or_else(|| format!("{}::usage", provider.id));
+
+        let status = SecretStoreService::bind_secret(
+            app_type.clone(),
+            &usage_secret_ref,
+            &usage_api_key,
+            policy,
+        )?;
+
+        let meta = provider.meta.get_or_insert_with(Default::default);
+        meta.usage_secret_ref = Some(usage_secret_ref);
+        meta.usage_secret_policy = Some(Self::secret_policy_to_meta_value(&status.policy));
+        if let Some(script) = meta.usage_script.as_mut() {
+            script.api_key = None;
+        }
+
+        Ok(())
+    }
+
+    fn cleanup_secret_refs_for_deleted_provider(
+        app_type: &AppType,
+        provider_id: &str,
+        provider: Option<&Provider>,
+    ) {
+        let mut refs = vec![provider_id.to_string(), format!("{provider_id}::usage")];
+
+        if let Some(meta) = provider.and_then(|p| p.meta.as_ref()) {
+            if let Some(secret_ref) = meta.secret_ref.as_deref() {
+                if !secret_ref.is_empty() && !refs.iter().any(|value| value == secret_ref) {
+                    refs.push(secret_ref.to_string());
+                }
+            }
+
+            if let Some(usage_secret_ref) = meta.usage_secret_ref.as_deref() {
+                if !usage_secret_ref.is_empty()
+                    && !refs.iter().any(|value| value == usage_secret_ref)
+                {
+                    refs.push(usage_secret_ref.to_string());
+                }
+            }
+        }
+
+        for secret_ref in refs {
+            if let Err(e) = SecretStoreService::delete_secret(app_type.clone(), &secret_ref) {
+                log::warn!(
+                    "清理 SecretStore 密钥失败（app={}, ref={}）: {}",
+                    app_type.as_str(),
+                    secret_ref,
+                    e
+                );
+            }
+        }
+    }
+
+    pub(super) fn resolve_provider_secret(provider: &Provider, app_type: &AppType) -> Option<String> {
+        let secret_ref = provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.secret_ref.as_deref())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(provider.id.as_str());
+
+        let policy_hint = provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.secret_policy.as_deref())
+            .map(|value| SecretPolicy::parse(Some(value)));
+
+        match SecretStoreService::read_secret(app_type.clone(), secret_ref, policy_hint) {
+            Ok(secret) => secret,
+            Err(e) => {
+                log::warn!(
+                    "读取 SecretStore 密钥失败（provider={}, app={}, ref={}）: {}",
+                    provider.id,
+                    app_type.as_str(),
+                    secret_ref,
+                    e
+                );
+                None
+            }
+        }
+    }
+
     fn normalize_provider_if_claude(app_type: &AppType, provider: &mut Provider) {
         if matches!(app_type, AppType::Claude) {
             let mut v = provider.settings_config.clone();
@@ -148,51 +404,51 @@ impl ProviderService {
     /// Get current provider ID
     ///
     /// 使用有效的当前供应商 ID（验证过存在性）。
+
     /// 优先从本地 settings 读取，验证后 fallback 到数据库的 is_current 字段。
     /// 这确保了云同步场景下多设备可以独立选择供应商，且返回的 ID 一定有效。
     ///
     /// 对于累加模式应用（OpenCode, OpenClaw），不存在"当前供应商"概念，直接返回空字符串。
     pub fn current(state: &AppState, app_type: AppType) -> Result<String, AppError> {
+
         // Additive mode apps have no "current" provider concept
         if app_type.is_additive_mode() {
             return Ok(String::new());
+
         }
         crate::settings::get_effective_current_provider(&state.db, &app_type)
+
             .map(|opt| opt.unwrap_or_default())
     }
 
     /// Add a new provider
     pub fn add(state: &AppState, app_type: AppType, provider: Provider) -> Result<bool, AppError> {
         let mut provider = provider;
-        // Normalize Claude model keys
         Self::normalize_provider_if_claude(&app_type, &mut provider);
         Self::validate_provider_settings(&app_type, &provider)?;
+        Self::migrate_usage_script_secret_if_needed(&app_type, &mut provider)?;
 
-        // Save to database
         state.db.save_provider(app_type.as_str(), &provider)?;
 
-        // Additive mode apps (OpenCode, OpenClaw) - always write to live config
         if app_type.is_additive_mode() {
-            // OMO / OMO Slim providers use exclusive mode and write to dedicated config file.
             if matches!(app_type, AppType::OpenCode)
                 && matches!(provider.category.as_deref(), Some("omo") | Some("omo-slim"))
             {
-                // Do not auto-enable newly added OMO / OMO Slim providers.
-                // Users must explicitly switch/apply an OMO provider to activate it.
                 return Ok(true);
             }
-            write_live_snapshot(&app_type, &provider)?;
+
+            let provider_for_live = Self::materialize_provider_for_live(&provider, &app_type);
+            write_live_snapshot(&app_type, &provider_for_live)?;
             return Ok(true);
         }
 
-        // For other apps: Check if sync is needed (if this is current provider, or no current provider)
         let current = state.db.get_current_provider(app_type.as_str())?;
         if current.is_none() {
-            // No current provider, set as current and sync
             state
                 .db
                 .set_current_provider(app_type.as_str(), &provider.id)?;
-            write_live_snapshot(&app_type, &provider)?;
+            let provider_for_live = Self::materialize_provider_for_live(&provider, &app_type);
+            write_live_snapshot(&app_type, &provider_for_live)?;
         }
 
         Ok(true)
@@ -205,14 +461,12 @@ impl ProviderService {
         provider: Provider,
     ) -> Result<bool, AppError> {
         let mut provider = provider;
-        // Normalize Claude model keys
         Self::normalize_provider_if_claude(&app_type, &mut provider);
         Self::validate_provider_settings(&app_type, &provider)?;
+        Self::migrate_usage_script_secret_if_needed(&app_type, &mut provider)?;
 
-        // Save to database
         state.db.save_provider(app_type.as_str(), &provider)?;
 
-        // Additive mode apps (OpenCode, OpenClaw) - always update in live config
         if app_type.is_additive_mode() {
             if matches!(app_type, AppType::OpenCode) && provider.category.as_deref() == Some("omo")
             {
@@ -228,6 +482,7 @@ impl ProviderService {
                 }
                 return Ok(true);
             }
+
             if matches!(app_type, AppType::OpenCode)
                 && provider.category.as_deref() == Some("omo-slim")
             {
@@ -244,19 +499,17 @@ impl ProviderService {
                 }
                 return Ok(true);
             }
-            write_live_snapshot(&app_type, &provider)?;
+
+            let provider_for_live = Self::materialize_provider_for_live(&provider, &app_type);
+            write_live_snapshot(&app_type, &provider_for_live)?;
             return Ok(true);
         }
 
-        // For other apps: Check if this is current provider (use effective current, not just DB)
         let effective_current =
             crate::settings::get_effective_current_provider(&state.db, &app_type)?;
         let is_current = effective_current.as_deref() == Some(provider.id.as_str());
 
         if is_current {
-            // 如果代理接管模式处于激活状态，并且代理服务正在运行：
-            // - 不写 Live 配置（否则会破坏接管）
-            // - 仅更新 Live 备份（保证关闭代理时能恢复到最新配置）
             let is_app_taken_over =
                 futures::executor::block_on(state.db.get_live_backup(app_type.as_str()))
                     .ok()
@@ -265,16 +518,17 @@ impl ProviderService {
             let is_proxy_running = futures::executor::block_on(state.proxy_service.is_running());
             let should_skip_live_write = is_app_taken_over && is_proxy_running;
 
+            let provider_for_live = Self::materialize_provider_for_live(&provider, &app_type);
+
             if should_skip_live_write {
                 futures::executor::block_on(
                     state
                         .proxy_service
-                        .update_live_backup_from_provider(app_type.as_str(), &provider),
+                        .update_live_backup_from_provider(app_type.as_str(), &provider_for_live),
                 )
                 .map_err(|e| AppError::Message(format!("更新 Live 备份失败: {e}")))?;
             } else {
-                write_live_snapshot(&app_type, &provider)?;
-                // Sync MCP
+                write_live_snapshot(&app_type, &provider_for_live)?;
                 McpService::sync_all_enabled(state)?;
             }
         }
@@ -287,13 +541,12 @@ impl ProviderService {
     /// 同时检查本地 settings 和数据库的当前供应商，防止删除任一端正在使用的供应商。
     /// 对于累加模式应用（OpenCode, OpenClaw），可以随时删除任意供应商，同时从 live 配置中移除。
     pub fn delete(state: &AppState, app_type: AppType, id: &str) -> Result<(), AppError> {
+        let provider_snapshot = state.db.get_provider_by_id(id, app_type.as_str())?;
+
         // Additive mode apps - no current provider concept
         if app_type.is_additive_mode() {
             if matches!(app_type, AppType::OpenCode) {
-                let provider_category = state
-                    .db
-                    .get_provider_by_id(id, app_type.as_str())?
-                    .and_then(|p| p.category);
+                let provider_category = provider_snapshot.as_ref().and_then(|p| p.category.clone());
 
                 if provider_category.as_deref() == Some("omo") {
                     let was_current =
@@ -302,6 +555,11 @@ impl ProviderService {
                             .is_omo_provider_current(app_type.as_str(), id, "omo")?;
 
                     state.db.delete_provider(app_type.as_str(), id)?;
+                    Self::cleanup_secret_refs_for_deleted_provider(
+                        &app_type,
+                        id,
+                        provider_snapshot.as_ref(),
+                    );
                     if was_current {
                         crate::services::OmoService::delete_config_file(
                             &crate::services::omo::STANDARD,
@@ -317,6 +575,11 @@ impl ProviderService {
                             .is_omo_provider_current(app_type.as_str(), id, "omo-slim")?;
 
                     state.db.delete_provider(app_type.as_str(), id)?;
+                    Self::cleanup_secret_refs_for_deleted_provider(
+                        &app_type,
+                        id,
+                        provider_snapshot.as_ref(),
+                    );
                     if was_current {
                         crate::services::OmoService::delete_config_file(
                             &crate::services::omo::SLIM,
@@ -327,6 +590,7 @@ impl ProviderService {
             }
             // Remove from database
             state.db.delete_provider(app_type.as_str(), id)?;
+            Self::cleanup_secret_refs_for_deleted_provider(&app_type, id, provider_snapshot.as_ref());
             // Also remove from live config
             match app_type {
                 AppType::OpenCode => remove_opencode_provider_from_live(id)?,
@@ -346,7 +610,9 @@ impl ProviderService {
             ));
         }
 
-        state.db.delete_provider(app_type.as_str(), id)
+        state.db.delete_provider(app_type.as_str(), id)?;
+        Self::cleanup_secret_refs_for_deleted_provider(&app_type, id, provider_snapshot.as_ref());
+        Ok(())
     }
 
     /// Remove provider from live config only (for additive mode apps like OpenCode, OpenClaw)
@@ -485,11 +751,13 @@ impl ProviderService {
             // Update local settings for consistency
             crate::settings::set_current_provider(&app_type, Some(id))?;
 
-            // 更新 Live 备份（确保代理关闭时恢复正确的供应商配置）
+                let provider_for_live = Self::materialize_provider_for_live(provider, &app_type);
+
+                // 更新 Live 备份（确保代理关闭时恢复正确的供应商配置）
             futures::executor::block_on(
                 state
                     .proxy_service
-                    .update_live_backup_from_provider(app_type.as_str(), provider),
+                    .update_live_backup_from_provider(app_type.as_str(), &provider_for_live),
             )
             .map_err(|e| AppError::Message(format!("更新 Live 备份失败: {e}")))?;
 
@@ -520,6 +788,20 @@ impl ProviderService {
         let provider = providers
             .get(id)
             .ok_or_else(|| AppError::Message(format!("供应商 {id} 不存在")))?;
+
+        let provider = match Self::lazy_migrate_provider_secret_if_needed(state, &app_type, provider)
+        {
+            Ok(migrated) => migrated,
+            Err(e) => {
+                log::warn!(
+                    "懒迁移 SecretStore 失败（provider={}, app={}）: {}",
+                    id,
+                    app_type.as_str(),
+                    e
+                );
+                provider.clone()
+            }
+        };
 
         if matches!(app_type, AppType::OpenCode) && provider.category.as_deref() == Some("omo") {
             state
@@ -585,7 +867,8 @@ impl ProviderService {
         }
 
         // Sync to live (write_gemini_live handles security flag internally for Gemini)
-        write_live_snapshot(&app_type, provider)?;
+        let provider_for_live = Self::materialize_provider_for_live(&provider, &app_type);
+        write_live_snapshot(&app_type, &provider_for_live)?;
 
         // Sync MCP
         McpService::sync_all_enabled(state)?;
@@ -1019,6 +1302,8 @@ impl ProviderService {
         provider: &Provider,
         app_type: &AppType,
     ) -> Result<(String, String), AppError> {
+        let secret_from_store = Self::resolve_provider_secret(provider, app_type);
+
         match app_type {
             AppType::Claude => {
                 let env = provider
@@ -1037,6 +1322,8 @@ impl ProviderService {
                     .get("ANTHROPIC_AUTH_TOKEN")
                     .or_else(|| env.get("ANTHROPIC_API_KEY"))
                     .and_then(|v| v.as_str())
+                    .map(|value| value.to_string())
+                    .or_else(|| secret_from_store.clone())
                     .ok_or_else(|| {
                         AppError::localized(
                             "provider.claude.api_key.missing",
@@ -1076,14 +1363,15 @@ impl ProviderService {
                 let api_key = auth
                     .get("OPENAI_API_KEY")
                     .and_then(|v| v.as_str())
+                    .map(|value| value.to_string())
+                    .or_else(|| secret_from_store.clone())
                     .ok_or_else(|| {
                         AppError::localized(
                             "provider.codex.api_key.missing",
                             "缺少 API Key",
                             "API key is missing",
                         )
-                    })?
-                    .to_string();
+                    })?;
 
                 let config_toml = provider
                     .settings_config
@@ -1124,13 +1412,17 @@ impl ProviderService {
 
                 let env_map = json_to_env(&provider.settings_config)?;
 
-                let api_key = env_map.get("GEMINI_API_KEY").cloned().ok_or_else(|| {
-                    AppError::localized(
-                        "gemini.missing_api_key",
-                        "缺少 GEMINI_API_KEY",
-                        "Missing GEMINI_API_KEY",
-                    )
-                })?;
+                let api_key = env_map
+                    .get("GEMINI_API_KEY")
+                    .cloned()
+                    .or_else(|| secret_from_store.clone())
+                    .ok_or_else(|| {
+                        AppError::localized(
+                            "gemini.missing_api_key",
+                            "缺少 GEMINI_API_KEY",
+                            "Missing GEMINI_API_KEY",
+                        )
+                    })?;
 
                 let base_url = env_map
                     .get("GOOGLE_GEMINI_BASE_URL")
@@ -1156,14 +1448,15 @@ impl ProviderService {
                 let api_key = options
                     .get("apiKey")
                     .and_then(|v| v.as_str())
+                    .map(|value| value.to_string())
+                    .or_else(|| secret_from_store.clone())
                     .ok_or_else(|| {
                         AppError::localized(
                             "provider.opencode.api_key.missing",
                             "缺少 API Key",
                             "API key is missing",
                         )
-                    })?
-                    .to_string();
+                    })?;
 
                 let base_url = options
                     .get("baseURL")
@@ -1179,14 +1472,15 @@ impl ProviderService {
                     .settings_config
                     .get("apiKey")
                     .and_then(|v| v.as_str())
+                    .map(|value| value.to_string())
+                    .or_else(|| secret_from_store.clone())
                     .ok_or_else(|| {
                         AppError::localized(
                             "provider.openclaw.api_key.missing",
                             "缺少 API Key",
                             "API key is missing",
                         )
-                    })?
-                    .to_string();
+                    })?;
 
                 let base_url = provider
                     .settings_config
@@ -1329,14 +1623,17 @@ impl ProviderService {
             if p.apps.claude {
                 let claude_id = format!("universal-claude-{id}");
                 let _ = state.db.delete_provider("claude", &claude_id);
+                Self::cleanup_secret_refs_for_deleted_provider(&AppType::Claude, &claude_id, None);
             }
             if p.apps.codex {
                 let codex_id = format!("universal-codex-{id}");
                 let _ = state.db.delete_provider("codex", &codex_id);
+                Self::cleanup_secret_refs_for_deleted_provider(&AppType::Codex, &codex_id, None);
             }
             if p.apps.gemini {
                 let gemini_id = format!("universal-gemini-{id}");
                 let _ = state.db.delete_provider("gemini", &gemini_id);
+                Self::cleanup_secret_refs_for_deleted_provider(&AppType::Gemini, &gemini_id, None);
             }
         }
 
@@ -1363,6 +1660,7 @@ impl ProviderService {
             // 如果禁用了 Claude，删除对应的子供应商
             let claude_id = format!("universal-claude-{id}");
             let _ = state.db.delete_provider("claude", &claude_id);
+            Self::cleanup_secret_refs_for_deleted_provider(&AppType::Claude, &claude_id, None);
         }
 
         // 同步到 Codex
@@ -1377,6 +1675,7 @@ impl ProviderService {
         } else {
             let codex_id = format!("universal-codex-{id}");
             let _ = state.db.delete_provider("codex", &codex_id);
+            Self::cleanup_secret_refs_for_deleted_provider(&AppType::Codex, &codex_id, None);
         }
 
         // 同步到 Gemini
@@ -1391,6 +1690,7 @@ impl ProviderService {
         } else {
             let gemini_id = format!("universal-gemini-{id}");
             let _ = state.db.delete_provider("gemini", &gemini_id);
+            Self::cleanup_secret_refs_for_deleted_provider(&AppType::Gemini, &gemini_id, None);
         }
 
         Ok(true)

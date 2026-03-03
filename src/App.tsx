@@ -39,6 +39,7 @@ import { useAutoCompact } from "@/hooks/useAutoCompact";
 import { useLastValidValue } from "@/hooks/useLastValidValue";
 import { extractErrorMessage } from "@/utils/errorUtils";
 import { isTextEditableTarget } from "@/utils/domUtils";
+import { mergeProviderMetaPreserveSecrets } from "@/utils/providerMetaUtils";
 import { cn } from "@/lib/utils";
 import { isWindows, isLinux } from "@/lib/platform";
 import { AppSwitcher } from "@/components/AppSwitcher";
@@ -587,8 +588,11 @@ function App() {
       category: provider.category,
       sortIndex: newSortIndex, // 复制原 sortIndex + 1
       meta: provider.meta
-        ? JSON.parse(JSON.stringify(provider.meta))
-        : undefined, // 深拷贝
+        ? mergeProviderMetaPreserveSecrets(
+            undefined,
+            JSON.parse(JSON.stringify(provider.meta)),
+          )
+        : undefined, // 深拷贝并统一保留 secret 字段策略
       icon: provider.icon,
       iconColor: provider.iconColor,
     };

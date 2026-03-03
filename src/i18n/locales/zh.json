@@ -136,6 +136,11 @@
     "usageSaveFailed": "用量查询配置保存失败",
     "geminiConfig": "Gemini 配置",
     "geminiConfigHint": "使用 .env 格式配置 Gemini",
+    "secret": {
+      "fido2UnsupportedPlatform": "当前平台暂不支持原生 FIDO2，请改用系统钥匙串或明文兼容模式",
+      "fido2NativeNotEnabled": "原生 FIDO2 尚未启用，请暂时使用 emulated 后端或其他策略",
+      "fido2RefreshProbe": "刷新 FIDO2 探测"
+    },
     "form": {
       "gemini": {
         "model": "模型",

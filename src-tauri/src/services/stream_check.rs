@@ -13,6 +13,7 @@ use crate::app_config::AppType;
 use crate::error::AppError;
 use crate::provider::Provider;
 use crate::proxy::providers::{get_adapter, AuthInfo, AuthStrategy};
+use crate::services::ProviderService;
 
 /// 健康状态枚举
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -77,6 +78,82 @@ pub struct StreamCheckResult {
 pub struct StreamCheckService;
 
 impl StreamCheckService {
+    fn inject_secret_for_stream_check(provider: &mut Provider, app_type: &AppType, secret: &str) {
+        if secret.trim().is_empty() {
+            return;
+        }
+
+        match app_type {
+            AppType::Claude => {
+                if provider.settings_config.is_null() {
+                    provider.settings_config = json!({});
+                }
+
+                if let Some(root) = provider.settings_config.as_object_mut() {
+                    let env = root
+                        .entry("env")
+                        .or_insert_with(|| json!({}))
+                        .as_object_mut();
+
+                    if let Some(env_obj) = env {
+                        if !env_obj.contains_key("ANTHROPIC_AUTH_TOKEN")
+                            && !env_obj.contains_key("ANTHROPIC_API_KEY")
+                            && !env_obj.contains_key("OPENROUTER_API_KEY")
+                            && !env_obj.contains_key("OPENAI_API_KEY")
+                        {
+                            env_obj.insert("ANTHROPIC_AUTH_TOKEN".to_string(), json!(secret));
+                        }
+                    }
+                }
+            }
+            AppType::Codex => {
+                if provider.settings_config.is_null() {
+                    provider.settings_config = json!({});
+                }
+
+                if let Some(root) = provider.settings_config.as_object_mut() {
+                    let auth = root
+                        .entry("auth")
+                        .or_insert_with(|| json!({}))
+                        .as_object_mut();
+
+                    if let Some(auth_obj) = auth {
+                        if !auth_obj.contains_key("OPENAI_API_KEY") {
+                            auth_obj.insert("OPENAI_API_KEY".to_string(), json!(secret));
+                        }
+                    }
+                }
+            }
+            AppType::Gemini => {
+                if provider.settings_config.is_null() {
+                    provider.settings_config = json!({});
+                }
+
+                if let Some(root) = provider.settings_config.as_object_mut() {
+                    let env = root
+                        .entry("env")
+                        .or_insert_with(|| json!({}))
+                        .as_object_mut();
+
+                    if let Some(env_obj) = env {
+                        if !env_obj.contains_key("GEMINI_API_KEY") {
+                            env_obj.insert("GEMINI_API_KEY".to_string(), json!(secret));
+                        }
+                    }
+                }
+            }
+            AppType::OpenCode | AppType::OpenClaw => {}
+        }
+    }
+
+    fn materialize_provider_for_stream_check(app_type: &AppType, provider: &Provider) -> Provider {
+        let mut provider_for_check = provider.clone();
+        if let Some(secret) = ProviderService::resolve_provider_secret(provider, app_type) {
+            Self::inject_secret_for_stream_check(&mut provider_for_check, app_type, &secret);
+        }
+        provider_for_check
+    }
+
     /// 执行流式健康检查（带重试）
     ///
     /// 如果 Provider 配置了单独的测试配置（meta.testConfig），则使用该配置覆盖全局配置
@@ -180,22 +257,26 @@ impl StreamCheckService {
         config: &StreamCheckConfig,
     ) -> Result<StreamCheckResult, AppError> {
         let start = Instant::now();
+        let provider_for_check = Self::materialize_provider_for_stream_check(app_type, provider);
         let adapter = get_adapter(app_type);
 
         let base_url = adapter
-            .extract_base_url(provider)
+            .extract_base_url(&provider_for_check)
             .map_err(|e| AppError::Message(format!("Failed to extract base_url: {e}")))?;
 
         let auth = adapter
-            .extract_auth(provider)
+            .extract_auth(&provider_for_check)
             .ok_or_else(|| AppError::Message("API Key not found".to_string()))?;
 
         // 获取 HTTP 客户端：优先使用供应商单独代理配置，否则使用全局客户端
-        let proxy_config = provider.meta.as_ref().and_then(|m| m.proxy_config.as_ref());
+        let proxy_config = provider_for_check
+            .meta
+            .as_ref()
+            .and_then(|m| m.proxy_config.as_ref());
         let client = crate::proxy::http_client::get_for_provider(proxy_config);
         let request_timeout = std::time::Duration::from_secs(config.timeout_secs);
 
-        let model_to_test = Self::resolve_test_model(app_type, provider, config);
+        let model_to_test = Self::resolve_test_model(app_type, &provider_for_check, config);
         let test_prompt = &config.test_prompt;
 
         let result = match app_type {
@@ -658,6 +739,9 @@ impl StreamCheckService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ProviderMeta;
+    use crate::services::{SecretPolicy, SecretStoreService};
+    use serde_json::json;
 
     #[test]
     fn test_determine_status() {
@@ -754,5 +838,43 @@ mod tests {
         assert_eq!(anthropic, AuthStrategy::Anthropic);
         assert_eq!(claude_auth, AuthStrategy::ClaudeAuth);
         assert_eq!(bearer, AuthStrategy::Bearer);
+    }
+
+    #[test]
+    fn test_materialize_provider_for_stream_check_injects_secret() {
+        let mut provider = Provider::with_id(
+            "stream-secret-provider".to_string(),
+            "Stream Secret Provider".to_string(),
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://api.anthropic.com"
+                }
+            }),
+            None,
+        );
+
+        provider.meta = Some(ProviderMeta {
+            secret_ref: Some("stream-secret-provider::main".to_string()),
+            secret_policy: Some("plain".to_string()),
+            ..Default::default()
+        });
+
+        SecretStoreService::bind_secret(
+            AppType::Claude,
+            "stream-secret-provider::main",
+            "stream-secret",
+            SecretPolicy::Plain,
+        )
+        .expect("bind stream secret");
+
+        let provider_for_check =
+            StreamCheckService::materialize_provider_for_stream_check(&AppType::Claude, &provider);
+
+        let injected = provider_for_check
+            .settings_config
+            .get("env")
+            .and_then(|v| v.get("ANTHROPIC_AUTH_TOKEN"))
+            .and_then(|v| v.as_str());
+        assert_eq!(injected, Some("stream-secret"));
     }
 }

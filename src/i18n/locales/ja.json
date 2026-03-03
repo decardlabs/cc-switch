@@ -136,6 +136,11 @@
     "usageSaveFailed": "利用状況設定の保存に失敗しました",
     "geminiConfig": "Gemini 設定",
     "geminiConfigHint": ".env 形式で Gemini を設定してください",
+    "secret": {
+      "fido2UnsupportedPlatform": "このプラットフォームではネイティブ FIDO2 がまだサポートされていません。システムキーチェーンまたは互換モードを利用してください。",
+      "fido2NativeNotEnabled": "ネイティブ FIDO2 はまだ有効化されていません。しばらくは emulated バックエンドまたは他のポリシーを利用してください。",
+      "fido2RefreshProbe": "FIDO2 プローブを再取得"
+    },
     "form": {
       "gemini": {
         "model": "モデル",

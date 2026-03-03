@@ -57,3 +57,25 @@ export function mergeProviderMeta(
 
   return { ...initialMeta };
 }
+
+/**
+ * 合并 meta 并保留密钥保护相关字段，防止普通编辑流程覆盖安全元数据。
+ */
+export function mergeProviderMetaPreserveSecrets(
+  existingMeta: ProviderMeta | undefined,
+  nextMeta: ProviderMeta | undefined,
+): ProviderMeta {
+  const current = existingMeta ?? {};
+  const incoming = nextMeta ?? {};
+
+  return {
+    ...current,
+    ...incoming,
+    secretRef: incoming.secretRef ?? current.secretRef,
+    secretPolicy: incoming.secretPolicy ?? current.secretPolicy,
+    secretLastUnlockedAt:
+      incoming.secretLastUnlockedAt ?? current.secretLastUnlockedAt,
+    usageSecretRef: incoming.usageSecretRef ?? current.usageSecretRef,
+    usageSecretPolicy: incoming.usageSecretPolicy ?? current.usageSecretPolicy,
+  };
+}

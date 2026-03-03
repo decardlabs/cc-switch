@@ -5,6 +5,7 @@
 use crate::app_config::AppType;
 use crate::error::AppError;
 use crate::provider::{UsageData, UsageResult, UsageScript};
+use crate::services::secret_store::{SecretPolicy, SecretStoreService};
 use crate::settings;
 use crate::store::AppState;
 use crate::usage_script;
@@ -144,11 +145,39 @@ pub async fn query_usage(
             ));
         }
 
-        // Get credentials: prioritize UsageScript values, fallback to provider config
+        let secret_from_store = super::ProviderService::resolve_provider_secret(provider, &app_type);
+        let usage_secret_from_store = provider
+            .meta
+            .as_ref()
+            .and_then(|m| m.usage_secret_ref.as_deref())
+            .and_then(|usage_ref| {
+                let policy_hint = provider
+                    .meta
+                    .as_ref()
+                    .and_then(|m| m.usage_secret_policy.as_deref())
+                    .map(|value| SecretPolicy::parse(Some(value)));
+
+                match SecretStoreService::read_secret(app_type.clone(), usage_ref, policy_hint) {
+                    Ok(secret) => secret,
+                    Err(e) => {
+                        log::warn!(
+                            "读取 Usage SecretStore 密钥失败（provider={}, app={}）: {}",
+                            provider.id,
+                            app_type.as_str(),
+                            e
+                        );
+                        None
+                    }
+                }
+            });
+
+        // Get credentials: UsageScript explicit values > Usage SecretStore > SecretStore > provider config
         let api_key = usage_script
             .api_key
             .clone()
             .filter(|k| !k.is_empty())
+            .or(usage_secret_from_store)
+            .or_else(|| secret_from_store)
             .or_else(|| extract_api_key_from_provider(provider))
             .unwrap_or_default();
 

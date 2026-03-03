@@ -8,7 +8,9 @@ import {
   ProviderForm,
   type ProviderFormValues,
 } from "@/components/providers/forms/ProviderForm";
+import { ProviderSecretPanel } from "@/components/providers/ProviderSecretPanel";
 import { providersApi, vscodeApi, type AppId } from "@/lib/api";
+import { mergeProviderMetaPreserveSecrets } from "@/utils/providerMetaUtils";
 
 interface EditProviderDialogProps {
   open: boolean;
@@ -155,7 +157,7 @@ export function EditProviderDialog({
         iconColor: values.iconColor?.trim() || undefined,
         ...(values.presetCategory ? { category: values.presetCategory } : {}),
         // 保留或更新 meta 字段
-        ...(values.meta ? { meta: values.meta } : {}),
+        meta: mergeProviderMetaPreserveSecrets(provider.meta, values.meta),
       };
 
       await onSubmit(updatedProvider);
@@ -193,6 +195,7 @@ export function EditProviderDialog({
         initialData={initialData}
         showButtons={false}
       />
+      <ProviderSecretPanel appId={appId} providerId={provider.id} open={open} />
     </FullScreenPanel>
   );
 }

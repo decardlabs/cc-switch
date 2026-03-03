@@ -235,6 +235,24 @@ pub struct ProviderMeta {
     /// - "openai_chat": OpenAI Chat Completions 格式，需要转换
     #[serde(rename = "apiFormat", skip_serializing_if = "Option::is_none")]
     pub api_format: Option<String>,
+    /// SecretStore 中密钥引用 ID
+    #[serde(rename = "secretRef", skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<String>,
+    /// 密钥保护策略：plain | os_keychain | fido2_required
+    #[serde(rename = "secretPolicy", skip_serializing_if = "Option::is_none")]
+    pub secret_policy: Option<String>,
+    /// 最近一次解锁时间（unix 秒）
+    #[serde(
+        rename = "secretLastUnlockedAt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub secret_last_unlocked_at: Option<i64>,
+    /// 用量查询专用密钥引用 ID（当 usageApiKey 与主 key 不同）
+    #[serde(rename = "usageSecretRef", skip_serializing_if = "Option::is_none")]
+    pub usage_secret_ref: Option<String>,
+    /// 用量查询专用密钥策略：plain | os_keychain | fido2_required
+    #[serde(rename = "usageSecretPolicy", skip_serializing_if = "Option::is_none")]
+    pub usage_secret_policy: Option<String>,
 }
 
 impl ProviderManager {

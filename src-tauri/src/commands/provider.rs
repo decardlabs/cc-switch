@@ -4,11 +4,47 @@ use tauri::State;
 use crate::app_config::AppType;
 use crate::error::AppError;
 use crate::provider::Provider;
+use crate::services::secret_store::fido2::{self, Fido2AssertionResponse};
 use crate::services::{
-    EndpointLatency, ProviderService, ProviderSortUpdate, SpeedtestService, SwitchResult,
+    EndpointLatency, ProviderService, ProviderSortUpdate, SecretPolicy, SecretStoreService,
+    SpeedtestService, SwitchResult,
 };
 use crate::store::AppState;
 use std::str::FromStr;
+
+fn secret_policy_to_string(policy: &SecretPolicy) -> String {
+    match policy {
+        SecretPolicy::Plain => "plain".to_string(),
+        SecretPolicy::OsKeychain => "os_keychain".to_string(),
+        SecretPolicy::Fido2Required => "fido2_required".to_string(),
+    }
+}
+
+fn persist_provider_secret_meta(
+    state: &AppState,
+    app_type: AppType,
+    provider_id: &str,
+    policy: &SecretPolicy,
+    last_unlocked_at: Option<i64>,
+) -> Result<(), AppError> {
+    let providers = ProviderService::list(state, app_type.clone())?;
+    let provider = providers
+        .get(provider_id)
+        .cloned()
+        .ok_or_else(|| AppError::InvalidInput(format!("provider 不存在: {provider_id}")))?;
+
+    let mut updated = provider.clone();
+    let mut meta = updated.meta.unwrap_or_default();
+    meta.secret_ref = Some(format!("secret:{}:{provider_id}", app_type.as_str()));
+    meta.secret_policy = Some(secret_policy_to_string(policy));
+    if let Some(value) = last_unlocked_at {
+        meta.secret_last_unlocked_at = Some(value);
+    }
+    updated.meta = Some(meta);
+
+    ProviderService::update(state, app_type, updated)?;
+    Ok(())
+}
 
 #[tauri::command]
 pub fn get_providers(
@@ -343,6 +379,188 @@ pub fn get_opencode_live_provider_ids() -> Result<Vec<String>, String> {
     crate::opencode_config::get_providers()
         .map(|providers| providers.keys().cloned().collect())
         .map_err(|e| e.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+pub fn enroll_provider_secret_protection(
+    state: State<'_, AppState>,
+    app: String,
+    #[allow(non_snake_case)] providerId: String,
+    policy: Option<String>,
+) -> Result<crate::services::EnrollResult, String> {
+    let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    let requested_policy = SecretPolicy::parse(policy.as_deref());
+    let result = SecretStoreService::enroll(app_type.clone(), &providerId, requested_policy.clone())
+        .map_err(|e| e.to_string())?;
+
+    persist_provider_secret_meta(
+        state.inner(),
+        app_type,
+        &providerId,
+        &requested_policy,
+        None,
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(result)
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+pub fn bind_provider_secret(
+    state: State<'_, AppState>,
+    app: String,
+    #[allow(non_snake_case)] providerId: String,
+    #[allow(non_snake_case)] apiKey: String,
+    policy: Option<String>,
+) -> Result<crate::services::SecretStatus, String> {
+    let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    let secret_policy = SecretPolicy::parse(policy.as_deref());
+    let result = SecretStoreService::bind_secret(
+        app_type.clone(),
+        &providerId,
+        &apiKey,
+        secret_policy.clone(),
+    )
+    .map_err(|e| e.to_string())?;
+
+    persist_provider_secret_meta(
+        state.inner(),
+        app_type,
+        &providerId,
+        &secret_policy,
+        result.last_unlocked_at,
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(result)
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+pub fn unlock_provider_secret(
+    state: State<'_, AppState>,
+    app: String,
+    #[allow(non_snake_case)] providerId: String,
+    reason: Option<String>,
+) -> Result<crate::services::UnlockTicket, String> {
+    let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    let ticket =
+        SecretStoreService::unlock_secret(app_type.clone(), &providerId, reason.as_deref())
+            .map_err(|e| e.to_string())?;
+    let status =
+        SecretStoreService::get_status(app_type.clone(), &providerId).map_err(|e| e.to_string())?;
+
+    persist_provider_secret_meta(
+        state.inner(),
+        app_type,
+        &providerId,
+        &status.policy,
+        status.last_unlocked_at,
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(ticket)
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+pub fn begin_provider_secret_fido2_assertion(
+    app: String,
+    #[allow(non_snake_case)] providerId: String,
+    reason: Option<String>,
+) -> Result<crate::services::secret_store::fido2::Fido2AssertionChallenge, String> {
+    let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    fido2::begin_assertion(&app_type, &providerId, reason.as_deref()).map_err(|e| e.to_string())
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+pub fn verify_provider_secret_fido2_assertion(
+    state: State<'_, AppState>,
+    app: String,
+    #[allow(non_snake_case)] providerId: String,
+    #[allow(non_snake_case)] challengeId: String,
+    signature: String,
+) -> Result<crate::services::UnlockTicket, String> {
+    let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+
+    let response = Fido2AssertionResponse {
+        challenge_id: challengeId,
+        signature,
+    };
+
+    fido2::verify_assertion(&app_type, &providerId, &response).map_err(|e| e.to_string())?;
+
+    let ticket = SecretStoreService::unlock_secret(
+        app_type.clone(),
+        &providerId,
+        Some("fido2_assertion_verified"),
+    )
+    .map_err(|e| e.to_string())?;
+
+    let status =
+        SecretStoreService::get_status(app_type.clone(), &providerId).map_err(|e| e.to_string())?;
+
+    persist_provider_secret_meta(
+        state.inner(),
+        app_type,
+        &providerId,
+        &status.policy,
+        status.last_unlocked_at,
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(ticket)
+}
+
+#[tauri::command]
+pub fn get_native_fido2_capability(
+) -> Result<crate::services::secret_store::fido2::NativeFido2Capability, String> {
+    let capability = fido2::probe_native_capability();
+    log::debug!(
+        "[FIDO2] native probe capability backend={} platform={} available={} code={}",
+        capability.backend,
+        capability.platform,
+        capability.available,
+        capability.code.as_deref().unwrap_or("none")
+    );
+    Ok(capability)
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+pub fn rotate_provider_secret(
+    state: State<'_, AppState>,
+    app: String,
+    #[allow(non_snake_case)] providerId: String,
+    #[allow(non_snake_case)] newApiKey: String,
+) -> Result<crate::services::SecretStatus, String> {
+    let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    let result = SecretStoreService::rotate_secret(app_type.clone(), &providerId, &newApiKey)
+        .map_err(|e| e.to_string())?;
+
+    persist_provider_secret_meta(
+        state.inner(),
+        app_type,
+        &providerId,
+        &result.policy,
+        result.last_unlocked_at,
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(result)
+}
+
+#[allow(non_snake_case)]
+#[tauri::command]
+pub fn get_provider_secret_status(
+    app: String,
+    #[allow(non_snake_case)] providerId: String,
+) -> Result<crate::services::SecretStatus, String> {
+    let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    SecretStoreService::get_status(app_type, &providerId).map_err(|e| e.to_string())
 }
 
 // ============================================================================

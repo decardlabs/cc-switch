@@ -5,9 +5,10 @@
 use crate::app_config::AppType;
 use crate::config::{get_claude_settings_path, read_json_file, write_json_file};
 use crate::database::Database;
-use crate::provider::Provider;
+use crate::provider::{Provider, ProviderMeta};
 use crate::proxy::server::ProxyServer;
 use crate::proxy::types::*;
+use crate::services::secret_store::{SecretPolicy, SecretStoreService};
 use crate::services::provider::write_live_snapshot;
 use serde_json::{json, Value};
 use std::str::FromStr;
@@ -387,6 +388,96 @@ impl ProxyService {
             .await
     }
 
+    fn secret_policy_to_meta_value(policy: &SecretPolicy) -> String {
+        match policy {
+            SecretPolicy::Plain => "plain".to_string(),
+            SecretPolicy::OsKeychain => "os_keychain".to_string(),
+            SecretPolicy::Fido2Required => "fido2_required".to_string(),
+        }
+    }
+
+    fn scrub_provider_inline_secret(provider: &mut Provider, app_type: &AppType) {
+        match app_type {
+            AppType::Claude => {
+                if let Some(env) = provider
+                    .settings_config
+                    .get_mut("env")
+                    .and_then(|v| v.as_object_mut())
+                {
+                    env.remove("ANTHROPIC_AUTH_TOKEN");
+                    env.remove("ANTHROPIC_API_KEY");
+                    env.remove("OPENROUTER_API_KEY");
+                    env.remove("OPENAI_API_KEY");
+                }
+                if let Some(root) = provider.settings_config.as_object_mut() {
+                    root.remove("api_key");
+                }
+            }
+            AppType::Codex => {
+                if let Some(auth) = provider
+                    .settings_config
+                    .get_mut("auth")
+                    .and_then(|v| v.as_object_mut())
+                {
+                    auth.remove("OPENAI_API_KEY");
+                }
+                if let Some(env) = provider
+                    .settings_config
+                    .get_mut("env")
+                    .and_then(|v| v.as_object_mut())
+                {
+                    env.remove("OPENAI_API_KEY");
+                }
+                if let Some(root) = provider.settings_config.as_object_mut() {
+                    root.remove("api_key");
+                }
+            }
+            AppType::Gemini => {
+                if let Some(env) = provider
+                    .settings_config
+                    .get_mut("env")
+                    .and_then(|v| v.as_object_mut())
+                {
+                    env.remove("GEMINI_API_KEY");
+                }
+                if let Some(root) = provider.settings_config.as_object_mut() {
+                    root.remove("api_key");
+                }
+            }
+            AppType::OpenCode | AppType::OpenClaw => {}
+        }
+    }
+
+    async fn persist_live_secret_to_provider(
+        &self,
+        app_type: &AppType,
+        provider: &mut Provider,
+        token: &str,
+    ) -> Result<(), String> {
+        let policy = provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.secret_policy.as_deref())
+            .map(|value| SecretPolicy::parse(Some(value)))
+            .unwrap_or(SecretPolicy::Plain);
+
+        let status = SecretStoreService::bind_secret(app_type.clone(), &provider.id, token, policy)
+            .map_err(|e| format!("绑定 SecretStore 密钥失败: {e}"))?;
+
+        let meta = provider.meta.get_or_insert_with(ProviderMeta::default);
+        meta.secret_ref = Some(provider.id.clone());
+        meta.secret_policy = Some(Self::secret_policy_to_meta_value(&status.policy));
+        meta.secret_last_unlocked_at = status.last_unlocked_at;
+
+        Self::scrub_provider_inline_secret(provider, app_type);
+
+        self.db
+            .save_provider(app_type.as_str(), provider)
+            .map_err(|e| format!("保存供应商密钥配置失败: {e}"))?;
+
+        Ok(())
+    }
+
     async fn sync_live_config_to_provider(
         &self,
         app_type: &AppType,
@@ -419,70 +510,15 @@ impl ProxyService {
                                 !token.is_empty() && *token != PROXY_TOKEN_PLACEHOLDER
                             });
 
-                            if let Some((token_key, token)) = token_pair {
-                                let env_obj = provider
-                                    .settings_config
-                                    .get_mut("env")
-                                    .and_then(|v| v.as_object_mut());
-
-                                match env_obj {
-                                    Some(obj) => {
-                                        if token_key == "ANTHROPIC_AUTH_TOKEN"
-                                            || token_key == "ANTHROPIC_API_KEY"
-                                        {
-                                            let mut updated = false;
-                                            if obj.contains_key("ANTHROPIC_AUTH_TOKEN") {
-                                                obj.insert(
-                                                    "ANTHROPIC_AUTH_TOKEN".to_string(),
-                                                    json!(token),
-                                                );
-                                                updated = true;
-                                            }
-                                            if obj.contains_key("ANTHROPIC_API_KEY") {
-                                                obj.insert(
-                                                    "ANTHROPIC_API_KEY".to_string(),
-                                                    json!(token),
-                                                );
-                                                updated = true;
-                                            }
-                                            if !updated {
-                                                obj.insert(token_key.to_string(), json!(token));
-                                            }
-                                        } else {
-                                            obj.insert(token_key.to_string(), json!(token));
-                                        }
-                                    }
-                                    None => {
-                                        // 至少写入一份可用的 Token
-                                        if provider.settings_config.is_null() {
-                                            provider.settings_config = json!({});
-                                        }
-
-                                        if let Some(root) = provider.settings_config.as_object_mut()
-                                        {
-                                            root.insert(
-                                                "env".to_string(),
-                                                json!({ token_key: token }),
-                                            );
-                                        } else {
-                                            log::warn!(
-                                                "Claude provider settings_config 格式异常（非对象），跳过写入 Token (provider: {provider_id})"
-                                            );
-                                        }
-                                    }
-                                }
-
-                                if let Err(e) = self.db.update_provider_settings_config(
-                                    "claude",
-                                    &provider_id,
-                                    &provider.settings_config,
-                                ) {
-                                    log::warn!("同步 Claude Token 到数据库失败: {e}");
-                                } else {
-                                    log::info!(
-                                        "已同步 Claude Token 到数据库 (provider: {provider_id})"
-                                    );
-                                }
+                            if let Some((_token_key, token)) = token_pair {
+                                self.persist_live_secret_to_provider(app_type, &mut provider, token)
+                                    .await
+                                    .map_err(|e| format!(
+                                        "同步 Claude Token 到 SecretStore 失败 (provider: {provider_id}): {e}"
+                                    ))?;
+                                log::info!(
+                                    "已同步 Claude Token 到 SecretStore 并清理明文 (provider: {provider_id})"
+                                );
                             }
                         }
                     }
@@ -504,38 +540,14 @@ impl ProxyService {
                             .map(|s| s.trim())
                             .filter(|s| !s.is_empty() && *s != PROXY_TOKEN_PLACEHOLDER)
                         {
-                            if let Some(auth_obj) = provider
-                                .settings_config
-                                .get_mut("auth")
-                                .and_then(|v| v.as_object_mut())
-                            {
-                                auth_obj.insert("OPENAI_API_KEY".to_string(), json!(token));
-                            } else {
-                                if provider.settings_config.is_null() {
-                                    provider.settings_config = json!({});
-                                }
-
-                                if let Some(root) = provider.settings_config.as_object_mut() {
-                                    root.insert(
-                                        "auth".to_string(),
-                                        json!({ "OPENAI_API_KEY": token }),
-                                    );
-                                } else {
-                                    log::warn!(
-                                        "Codex provider settings_config 格式异常（非对象），跳过写入 Token (provider: {provider_id})"
-                                    );
-                                }
-                            }
-
-                            if let Err(e) = self.db.update_provider_settings_config(
-                                "codex",
-                                &provider_id,
-                                &provider.settings_config,
-                            ) {
-                                log::warn!("同步 Codex Token 到数据库失败: {e}");
-                            } else {
-                                log::info!("已同步 Codex Token 到数据库 (provider: {provider_id})");
-                            }
+                            self.persist_live_secret_to_provider(app_type, &mut provider, token)
+                                .await
+                                .map_err(|e| format!(
+                                    "同步 Codex Token 到 SecretStore 失败 (provider: {provider_id}): {e}"
+                                ))?;
+                            log::info!(
+                                "已同步 Codex Token 到 SecretStore 并清理明文 (provider: {provider_id})"
+                            );
                         }
                     }
                 }
@@ -556,40 +568,14 @@ impl ProxyService {
                             .map(|s| s.trim())
                             .filter(|s| !s.is_empty() && *s != PROXY_TOKEN_PLACEHOLDER)
                         {
-                            if let Some(env_obj) = provider
-                                .settings_config
-                                .get_mut("env")
-                                .and_then(|v| v.as_object_mut())
-                            {
-                                env_obj.insert("GEMINI_API_KEY".to_string(), json!(token));
-                            } else {
-                                if provider.settings_config.is_null() {
-                                    provider.settings_config = json!({});
-                                }
-
-                                if let Some(root) = provider.settings_config.as_object_mut() {
-                                    root.insert(
-                                        "env".to_string(),
-                                        json!({ "GEMINI_API_KEY": token }),
-                                    );
-                                } else {
-                                    log::warn!(
-                                        "Gemini provider settings_config 格式异常（非对象），跳过写入 Token (provider: {provider_id})"
-                                    );
-                                }
-                            }
-
-                            if let Err(e) = self.db.update_provider_settings_config(
-                                "gemini",
-                                &provider_id,
-                                &provider.settings_config,
-                            ) {
-                                log::warn!("同步 Gemini Token 到数据库失败: {e}");
-                            } else {
-                                log::info!(
-                                    "已同步 Gemini Token 到数据库 (provider: {provider_id})"
-                                );
-                            }
+                            self.persist_live_secret_to_provider(app_type, &mut provider, token)
+                                .await
+                                .map_err(|e| format!(
+                                    "同步 Gemini Token 到 SecretStore 失败 (provider: {provider_id}): {e}"
+                                ))?;
+                            log::info!(
+                                "已同步 Gemini Token 到 SecretStore 并清理明文 (provider: {provider_id})"
+                            );
                         }
                     }
                 }
@@ -2064,14 +2050,19 @@ model = "gpt-5.1-codex"
             .and_then(|v| v.as_object())
             .expect("env object");
 
-        assert_eq!(
-            env.get("ANTHROPIC_AUTH_TOKEN").and_then(|v| v.as_str()),
-            Some("fresh")
+        assert!(
+            !env.contains_key("ANTHROPIC_AUTH_TOKEN"),
+            "plaintext token should be removed after sync"
         );
         assert!(
             !env.contains_key("ANTHROPIC_API_KEY"),
             "should not add ANTHROPIC_API_KEY when absent"
         );
+
+        let stored = SecretStoreService::read_secret(AppType::Claude, "p1", None)
+            .expect("read secret")
+            .expect("secret exists");
+        assert_eq!(stored, "fresh");
     }
 
     #[tokio::test]
@@ -2120,14 +2111,19 @@ model = "gpt-5.1-codex"
             .and_then(|v| v.as_object())
             .expect("env object");
 
-        assert_eq!(
-            env.get("ANTHROPIC_API_KEY").and_then(|v| v.as_str()),
-            Some("fresh")
-        );
         assert!(
             !env.contains_key("ANTHROPIC_AUTH_TOKEN"),
             "should not add ANTHROPIC_AUTH_TOKEN when absent"
         );
+        assert!(
+            !env.contains_key("ANTHROPIC_API_KEY"),
+            "plaintext token should be removed after sync"
+        );
+
+        let stored = SecretStoreService::read_secret(AppType::Claude, "p1", None)
+            .expect("read secret")
+            .expect("secret exists");
+        assert_eq!(stored, "fresh");
     }
 
     #[tokio::test]

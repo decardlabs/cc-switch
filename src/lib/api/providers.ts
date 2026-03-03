@@ -21,6 +21,47 @@ export interface SwitchResult {
   warnings: string[];
 }
 
+export type SecretPolicy = "plain" | "os_keychain" | "fido2_required";
+
+export interface SecretEnrollResult {
+  app: AppId;
+  providerId: string;
+  requestedPolicy: SecretPolicy;
+  supported: boolean;
+  backend: string;
+  message: string;
+}
+
+export interface SecretUnlockTicket {
+  ticket: string;
+  expiresAt: number;
+}
+
+export interface Fido2AssertionChallenge {
+  backend: string;
+  challengeId: string;
+  challenge: string;
+  expiresAt: number;
+}
+
+export interface NativeFido2Capability {
+  backend: string;
+  platform: string;
+  available: boolean;
+  code?: string;
+  reason?: string;
+}
+
+export interface ProviderSecretStatus {
+  app: AppId;
+  providerId: string;
+  policy: SecretPolicy;
+  hasSecret: boolean;
+  canUseFido2: boolean;
+  lastUnlockedAt?: number;
+  message?: string;
+}
+
 export const providersApi = {
   async getAll(appId: AppId): Promise<Record<string, Provider>> {
     return await invoke("get_providers", { app: appId });
@@ -117,6 +158,96 @@ export const providersApi = {
    */
   async importOpenClawFromLive(): Promise<number> {
     return await invoke("import_openclaw_providers_from_live");
+  },
+
+  async enrollSecretProtection(
+    providerId: string,
+    appId: AppId,
+    policy: SecretPolicy,
+  ): Promise<SecretEnrollResult> {
+    return await invoke("enroll_provider_secret_protection", {
+      providerId,
+      app: appId,
+      policy,
+    });
+  },
+
+  async bindSecret(
+    providerId: string,
+    appId: AppId,
+    apiKey: string,
+    policy: SecretPolicy,
+  ): Promise<ProviderSecretStatus> {
+    return await invoke("bind_provider_secret", {
+      providerId,
+      app: appId,
+      apiKey,
+      policy,
+    });
+  },
+
+  async unlockSecret(
+    providerId: string,
+    appId: AppId,
+    reason?: string,
+  ): Promise<SecretUnlockTicket> {
+    return await invoke("unlock_provider_secret", {
+      providerId,
+      app: appId,
+      reason,
+    });
+  },
+
+  async beginFido2Assertion(
+    providerId: string,
+    appId: AppId,
+    reason?: string,
+  ): Promise<Fido2AssertionChallenge> {
+    return await invoke("begin_provider_secret_fido2_assertion", {
+      providerId,
+      app: appId,
+      reason,
+    });
+  },
+
+  async verifyFido2Assertion(
+    providerId: string,
+    appId: AppId,
+    challengeId: string,
+    signature: string,
+  ): Promise<SecretUnlockTicket> {
+    return await invoke("verify_provider_secret_fido2_assertion", {
+      providerId,
+      app: appId,
+      challengeId,
+      signature,
+    });
+  },
+
+  async getNativeFido2Capability(): Promise<NativeFido2Capability> {
+    return await invoke("get_native_fido2_capability");
+  },
+
+  async rotateSecret(
+    providerId: string,
+    appId: AppId,
+    newApiKey: string,
+  ): Promise<ProviderSecretStatus> {
+    return await invoke("rotate_provider_secret", {
+      providerId,
+      app: appId,
+      newApiKey,
+    });
+  },
+
+  async getSecretStatus(
+    providerId: string,
+    appId: AppId,
+  ): Promise<ProviderSecretStatus> {
+    return await invoke("get_provider_secret_status", {
+      providerId,
+      app: appId,
+    });
   },
 };
 

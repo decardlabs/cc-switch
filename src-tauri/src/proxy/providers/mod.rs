@@ -22,6 +22,7 @@ pub mod transform;
 
 use crate::app_config::AppType;
 use crate::provider::Provider;
+use crate::services::secret_store::{SecretPolicy, SecretStoreService};
 use serde::{Deserialize, Serialize};
 
 // 公开导出
@@ -204,6 +205,34 @@ pub fn get_adapter_for_provider_type(provider_type: &ProviderType) -> Box<dyn Pr
         }
         ProviderType::Codex => Box::new(CodexAdapter::new()),
         ProviderType::Gemini | ProviderType::GeminiCli => Box::new(GeminiAdapter::new()),
+    }
+}
+
+pub(crate) fn resolve_secret_for_proxy(provider: &Provider, app_type: AppType) -> Option<String> {
+    let secret_ref = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.secret_ref.as_deref())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(provider.id.as_str());
+
+    let policy_hint = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.secret_policy.as_deref())
+        .map(|value| SecretPolicy::parse(Some(value)));
+
+    match SecretStoreService::read_secret(app_type, secret_ref, policy_hint) {
+        Ok(secret) => secret,
+        Err(e) => {
+            log::warn!(
+                "[Proxy] SecretStore 读取失败(provider={}, ref={}): {}",
+                provider.id,
+                secret_ref,
+                e
+            );
+            None
+        }
     }
 }
 

@@ -17,6 +17,7 @@ import {
   useSwitchProviderMutation,
 } from "@/lib/query";
 import { extractErrorMessage } from "@/utils/errorUtils";
+import { mergeProviderMetaPreserveSecrets } from "@/utils/providerMetaUtils";
 import { openclawKeys } from "@/hooks/useOpenClaw";
 
 /**
@@ -202,10 +203,10 @@ export function useProviderActions(activeApp: AppId) {
       try {
         const updatedProvider: Provider = {
           ...provider,
-          meta: {
+          meta: mergeProviderMetaPreserveSecrets(provider.meta, {
             ...provider.meta,
             usage_script: script,
-          },
+          }),
         };
 
         await providersApi.update(updatedProvider, activeApp);

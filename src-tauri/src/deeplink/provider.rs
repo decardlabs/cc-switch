@@ -6,6 +6,7 @@ use super::utils::{decode_base64_param, infer_homepage_from_endpoint};
 use super::DeepLinkImportRequest;
 use crate::error::AppError;
 use crate::provider::{Provider, ProviderMeta, UsageScript};
+use crate::services::secret_store::{SecretPolicy, SecretStoreService};
 use crate::services::ProviderService;
 use crate::store::AppState;
 use crate::AppType;
@@ -50,6 +51,7 @@ pub fn import_provider_from_deeplink(
             "API key cannot be empty".to_string(),
         ));
     }
+    let provider_api_key = api_key.to_string();
 
     // Get endpoint: supports comma-separated multiple URLs (first is primary)
     let endpoint_str = merged_request.endpoint.as_ref().ok_or_else(|| {
@@ -107,6 +109,8 @@ pub fn import_provider_from_deeplink(
         .to_lowercase();
     provider.id = format!("{sanitized_name}-{timestamp}");
 
+    persist_secret_for_deeplink_provider(&app_type, &mut provider, &provider_api_key)?;
+
     let provider_id = provider.id.clone();
 
     // Use ProviderService to add the provider
@@ -134,6 +138,121 @@ pub fn import_provider_from_deeplink(
     }
 
     Ok(provider_id)
+}
+
+fn secret_policy_to_meta_value(policy: &SecretPolicy) -> String {
+    match policy {
+        SecretPolicy::Plain => "plain".to_string(),
+        SecretPolicy::OsKeychain => "os_keychain".to_string(),
+        SecretPolicy::Fido2Required => "fido2_required".to_string(),
+    }
+}
+
+fn scrub_inline_secret(provider: &mut Provider, app_type: &AppType) {
+    match app_type {
+        AppType::Claude => {
+            if let Some(env) = provider
+                .settings_config
+                .get_mut("env")
+                .and_then(|v| v.as_object_mut())
+            {
+                env.remove("ANTHROPIC_AUTH_TOKEN");
+                env.remove("ANTHROPIC_API_KEY");
+                env.remove("OPENROUTER_API_KEY");
+                env.remove("OPENAI_API_KEY");
+            }
+            if let Some(root) = provider.settings_config.as_object_mut() {
+                root.remove("api_key");
+            }
+        }
+        AppType::Codex => {
+            if let Some(auth) = provider
+                .settings_config
+                .get_mut("auth")
+                .and_then(|v| v.as_object_mut())
+            {
+                auth.remove("OPENAI_API_KEY");
+            }
+            if let Some(env) = provider
+                .settings_config
+                .get_mut("env")
+                .and_then(|v| v.as_object_mut())
+            {
+                env.remove("OPENAI_API_KEY");
+            }
+            if let Some(root) = provider.settings_config.as_object_mut() {
+                root.remove("api_key");
+            }
+        }
+        AppType::Gemini => {
+            if let Some(env) = provider
+                .settings_config
+                .get_mut("env")
+                .and_then(|v| v.as_object_mut())
+            {
+                env.remove("GEMINI_API_KEY");
+            }
+            if let Some(root) = provider.settings_config.as_object_mut() {
+                root.remove("api_key");
+            }
+        }
+        AppType::OpenCode | AppType::OpenClaw => {}
+    }
+}
+
+fn persist_secret_for_deeplink_provider(
+    app_type: &AppType,
+    provider: &mut Provider,
+    api_key: &str,
+) -> Result<(), AppError> {
+    if !matches!(app_type, AppType::Claude | AppType::Codex | AppType::Gemini) {
+        return Ok(());
+    }
+
+    let policy = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.secret_policy.as_deref())
+        .map(|value| SecretPolicy::parse(Some(value)))
+        .unwrap_or(SecretPolicy::Plain);
+
+    let status = SecretStoreService::bind_secret(app_type.clone(), &provider.id, api_key, policy)
+        .map_err(|e| AppError::Message(format!("绑定 SecretStore 密钥失败: {e}")))?;
+
+    let meta = provider.meta.get_or_insert_with(ProviderMeta::default);
+    meta.secret_ref = Some(provider.id.clone());
+    meta.secret_policy = Some(secret_policy_to_meta_value(&status.policy));
+    meta.secret_last_unlocked_at = status.last_unlocked_at;
+
+    if let Some(usage_script) = meta.usage_script.as_mut() {
+        if usage_script.api_key.as_deref() == Some(api_key) {
+            usage_script.api_key = None;
+            meta.usage_secret_ref = None;
+            meta.usage_secret_policy = None;
+        } else if let Some(usage_api_key) = usage_script
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let usage_ref = format!("{}::usage", provider.id);
+            let usage_status = SecretStoreService::bind_secret(
+                app_type.clone(),
+                &usage_ref,
+                usage_api_key,
+                status.policy.clone(),
+            )
+            .map_err(|e| AppError::Message(format!("绑定 Usage SecretStore 密钥失败: {e}")))?;
+
+            meta.usage_secret_ref = Some(usage_ref);
+            meta.usage_secret_policy = Some(secret_policy_to_meta_value(&usage_status.policy));
+            usage_script.api_key = None;
+        }
+    }
+
+    scrub_inline_secret(provider, app_type);
+
+    Ok(())
 }
 
 /// Build a Provider structure from a deep link request

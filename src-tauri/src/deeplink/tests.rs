@@ -3,9 +3,11 @@
 use super::mcp::parse_mcp_apps;
 use super::parser::parse_deeplink_url;
 use super::prompt::import_prompt_from_deeplink;
+use super::provider::import_provider_from_deeplink;
 use super::provider::parse_and_merge_config;
 use super::utils::{infer_homepage_from_endpoint, validate_url};
 use super::DeepLinkImportRequest;
+use crate::services::secret_store::SecretStoreService;
 use crate::AppType;
 use crate::{store::AppState, Database};
 use base64::prelude::*;
@@ -214,6 +216,194 @@ fn test_build_gemini_provider_without_model() {
     assert_eq!(env["GOOGLE_GEMINI_BASE_URL"], "https://api.example.com");
     // Model should not be present
     assert!(env.get("GEMINI_MODEL").is_none());
+}
+
+#[test]
+fn test_import_provider_from_deeplink_persists_secret_and_scrubs_plaintext() {
+    let db = Arc::new(Database::memory().expect("create memory db"));
+    let state = AppState::new(db.clone());
+
+    let request = DeepLinkImportRequest {
+        version: "v1".to_string(),
+        resource: "provider".to_string(),
+        app: Some("claude".to_string()),
+        name: Some("Secure Claude".to_string()),
+        homepage: Some("https://anthropic.com".to_string()),
+        endpoint: Some("https://api.anthropic.com/v1".to_string()),
+        api_key: Some("sk-ant-secret".to_string()),
+        icon: None,
+        model: Some("claude-sonnet-4-5-20250929".to_string()),
+        notes: None,
+        haiku_model: None,
+        sonnet_model: None,
+        opus_model: None,
+        config: None,
+        config_format: None,
+        config_url: None,
+        apps: None,
+        repo: None,
+        directory: None,
+        branch: None,
+        content: None,
+        description: None,
+        enabled: None,
+        usage_enabled: None,
+        usage_script: None,
+        usage_api_key: None,
+        usage_base_url: None,
+        usage_access_token: None,
+        usage_user_id: None,
+        usage_auto_interval: None,
+    };
+
+    let provider_id = import_provider_from_deeplink(&state, request).expect("import provider");
+    let provider = state
+        .db
+        .get_provider_by_id(&provider_id, "claude")
+        .expect("get provider")
+        .expect("provider exists");
+
+    let env = provider
+        .settings_config
+        .get("env")
+        .and_then(|v| v.as_object())
+        .expect("env object");
+
+    assert_eq!(
+        env.get("ANTHROPIC_BASE_URL").and_then(|v| v.as_str()),
+        Some("https://api.anthropic.com/v1")
+    );
+    assert!(
+        !env.contains_key("ANTHROPIC_AUTH_TOKEN"),
+        "plaintext API key should be removed"
+    );
+
+    let meta = provider.meta.expect("meta exists");
+    assert_eq!(meta.secret_ref.as_deref(), Some(provider_id.as_str()));
+    assert_eq!(meta.secret_policy.as_deref(), Some("plain"));
+
+    let secret = SecretStoreService::read_secret(AppType::Claude, &provider_id, None)
+        .expect("read secret")
+        .expect("secret exists");
+    assert_eq!(secret, "sk-ant-secret");
+}
+
+#[test]
+fn test_import_provider_from_deeplink_clears_default_usage_api_key() {
+    let db = Arc::new(Database::memory().expect("create memory db"));
+    let state = AppState::new(db.clone());
+    let usage_script_b64 = BASE64_STANDARD.encode("return { success: true, data: [] };".as_bytes());
+
+    let request = DeepLinkImportRequest {
+        version: "v1".to_string(),
+        resource: "provider".to_string(),
+        app: Some("gemini".to_string()),
+        name: Some("Secure Gemini".to_string()),
+        homepage: Some("https://ai.google.dev".to_string()),
+        endpoint: Some("https://generativelanguage.googleapis.com/v1beta".to_string()),
+        api_key: Some("gemini-secret".to_string()),
+        icon: None,
+        model: Some("gemini-2.5-pro".to_string()),
+        notes: None,
+        haiku_model: None,
+        sonnet_model: None,
+        opus_model: None,
+        config: None,
+        config_format: None,
+        config_url: None,
+        apps: None,
+        repo: None,
+        directory: None,
+        branch: None,
+        content: None,
+        description: None,
+        enabled: None,
+        usage_enabled: Some(true),
+        usage_script: Some(usage_script_b64),
+        usage_api_key: None,
+        usage_base_url: None,
+        usage_access_token: None,
+        usage_user_id: None,
+        usage_auto_interval: None,
+    };
+
+    let provider_id = import_provider_from_deeplink(&state, request).expect("import provider");
+    let provider = state
+        .db
+        .get_provider_by_id(&provider_id, "gemini")
+        .expect("get provider")
+        .expect("provider exists");
+
+    let usage_api_key = provider
+        .meta
+        .and_then(|m| m.usage_script)
+        .and_then(|u| u.api_key);
+    assert!(
+        usage_api_key.is_none(),
+        "default usage api key should be cleared to avoid plaintext duplication"
+    );
+}
+
+#[test]
+fn test_import_provider_from_deeplink_persists_explicit_usage_api_key_secret() {
+    let db = Arc::new(Database::memory().expect("create memory db"));
+    let state = AppState::new(db.clone());
+    let usage_script_b64 = BASE64_STANDARD.encode("return { success: true, data: [] };".as_bytes());
+
+    let request = DeepLinkImportRequest {
+        version: "v1".to_string(),
+        resource: "provider".to_string(),
+        app: Some("claude".to_string()),
+        name: Some("Usage Key Provider".to_string()),
+        homepage: Some("https://anthropic.com".to_string()),
+        endpoint: Some("https://api.anthropic.com/v1".to_string()),
+        api_key: Some("main-secret".to_string()),
+        icon: None,
+        model: Some("claude-sonnet-4-5-20250929".to_string()),
+        notes: None,
+        haiku_model: None,
+        sonnet_model: None,
+        opus_model: None,
+        config: None,
+        config_format: None,
+        config_url: None,
+        apps: None,
+        repo: None,
+        directory: None,
+        branch: None,
+        content: None,
+        description: None,
+        enabled: None,
+        usage_enabled: Some(true),
+        usage_script: Some(usage_script_b64),
+        usage_api_key: Some("usage-secret".to_string()),
+        usage_base_url: None,
+        usage_access_token: None,
+        usage_user_id: None,
+        usage_auto_interval: None,
+    };
+
+    let provider_id = import_provider_from_deeplink(&state, request).expect("import provider");
+    let provider = state
+        .db
+        .get_provider_by_id(&provider_id, "claude")
+        .expect("get provider")
+        .expect("provider exists");
+
+    let meta = provider.meta.expect("meta exists");
+    let usage_ref = meta.usage_secret_ref.expect("usage secret ref exists");
+    assert_eq!(meta.usage_secret_policy.as_deref(), Some("plain"));
+    let usage_plain = meta
+        .usage_script
+        .and_then(|u| u.api_key)
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    assert!(!usage_plain, "usage api key plaintext should be removed");
+
+    let usage_secret = SecretStoreService::read_secret(AppType::Claude, &usage_ref, None)
+        .expect("read usage secret")
+        .expect("usage secret exists");
+    assert_eq!(usage_secret, "usage-secret");
 }
 
 #[test]

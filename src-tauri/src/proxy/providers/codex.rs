@@ -5,7 +5,8 @@
 //! ## 客户端检测
 //! 支持检测官方 Codex 客户端 (codex_vscode, codex_cli_rs)
 
-use super::{AuthInfo, AuthStrategy, ProviderAdapter};
+use super::{resolve_secret_for_proxy, AuthInfo, AuthStrategy, ProviderAdapter};
+use crate::app_config::AppType;
 use crate::provider::Provider;
 use crate::proxy::error::ProxyError;
 use regex::Regex;
@@ -68,6 +69,10 @@ impl CodexAdapter {
             {
                 return Some(key.to_string());
             }
+        }
+
+        if let Some(secret) = resolve_secret_for_proxy(provider, AppType::Codex) {
+            return Some(secret);
         }
 
         None

@@ -996,6 +996,15 @@ pub fn run() {
             // OpenCode specific
             commands::import_opencode_providers_from_live,
             commands::get_opencode_live_provider_ids,
+            // Provider secret protection (Phase 0 skeleton)
+            commands::enroll_provider_secret_protection,
+            commands::bind_provider_secret,
+            commands::unlock_provider_secret,
+            commands::begin_provider_secret_fido2_assertion,
+            commands::verify_provider_secret_fido2_assertion,
+            commands::get_native_fido2_capability,
+            commands::rotate_provider_secret,
+            commands::get_provider_secret_status,
             // OpenClaw specific
             commands::import_openclaw_providers_from_live,
             commands::get_openclaw_live_provider_ids,
